@@ -1,3 +1,33 @@
 language: node_js
 node_js:
 - '0.10'
+# focal: gives php 7.4 + Apache (apache2 / libapache2-mod-php) for the QUnit suite.
+dist: focal
+
+before_install:
+- sudo apt-get update -qq
+# Shared libraries needed by puppeteer's headless Chromium.
+- sudo apt-get install -y --no-install-recommends libnss3 libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libcups2 libdrm2 libxkbcommon0 fonts-liberation
+
+# install: default `npm install` on node 0.10
+
+script:
+# Build dist/jquery.js + jquery.min.js and lint (grunt default task), on node 0.10.
+- npm test
+# Serve the built tree with Apache + mod_php (prefork, many workers) at
+# http://127.0.0.1/jquery/; the ajax tests hit test/data/*.php.
+- bash .github/scripts/serve-with-apache.sh
+# The headless runner needs a modern node; the project build above stays on 0.10.
+# puppeteer is installed into an isolated prefix (not the project's node_modules).
+# puppeteer 1.20.0 bundles Chromium 78, which still allows the synchronous XHR
+# during unload that test #14379 relies on (removed in Chrome 80).
+- nvm install 16
+- nvm exec 16 npm install --prefix /tmp/runner --registry=https://registry.npmjs.org/ --no-audit --no-fund --no-package-lock puppeteer@1.20.0
+# Runs test/index.html?dev=true (all modules, loading the freshly built dist/jquery.js),
+# prints every test, failure details and a summary; exits non-zero on any failure/timeout.
+# The runner lives in .github/scripts/: not linted by grunt, and .github/ is removed
+# before `npm pack` by .github/workflows/build.yml.
+- NODE_PATH=/tmp/runner/node_modules TEST_BASE_URL=http://127.0.0.1/jquery TEST_TIMEOUT_MIN=20 nvm exec 16 node .github/scripts/run-browser-tests.js
+
+after_failure:
+- sudo tail -n 50 /var/log/apache2/error.log

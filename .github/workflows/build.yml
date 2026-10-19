@@ -1,0 +1,174 @@
+name: build
+
+# Rebuilds the jquery 1.11.1 npm tarball from source and runs the full QUnit browser suite
+# against the built dist/jquery.js (the same suite .travis.yml runs), so test results show
+# in the GitHub log too.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 0.10 (the release toolchain), from the official dist tarball.
+      - name: Install node 0.10.48
+        run: |
+          set -euxo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/node.tar.gz" https://nodejs.org/dist/v0.10.48/node-v0.10.48-linux-x64.tar.gz
+          tar -xzf "$RUNNER_TEMP/node.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/node-v0.10.48-linux-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        run: |
+          set -eux
+          command -v node npm
+          node -v
+          npm -v
+
+      # Resolve dependency ranges as of the 1.11.1 release (e.g. uglify-js ~2.4.0
+      # through grunt-contrib-uglify 0.3.2 determines jquery.min.js bytes).
+      - name: npm install (registry as of 2014-05-01)
+        run: |
+          set -eux
+          npm config set registry 'https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm.sealsecurity.io/'
+          npm install
+          node -e 'console.log("uglify-js " + require("./node_modules/grunt-contrib-uglify/node_modules/uglify-js/package.json").version)'
+
+      - name: Install libfaketime
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends faketime
+
+      - name: Check faketime takes effect for node 0.10
+        run: |
+          set -eux
+          now="$(TZ=UTC faketime '2014-05-01 17:42:00' node -e 'console.log(new Date().toISOString())')"
+          echo "faked node date: $now"
+          case "$now" in
+            2014-05-01T17:42:*) ;;
+            *) echo "faketime did not take effect for node" >&2; exit 1 ;;
+          esac
+
+      # Default grunt task (what `npm test` runs): jsonlint, build, lint, uglify, dist, compare_size.
+      # Faked clock so the @DATE stamp in dist/jquery.js and the min banner year match the release.
+      - name: grunt (under faketime at the release build time)
+        run: |
+          set -eux
+          TZ=UTC faketime '2014-05-01 17:42:00' ./node_modules/.bin/grunt
+          grep -n 'Date: ' dist/jquery.js | head -1
+          head -c 200 dist/jquery.min.js; echo
+          sha256sum dist/jquery.js dist/jquery.min.js dist/jquery.min.map
+
+      # dist/cdn/* exactly as build/release.js makeReleaseCopies() makes them
+      # for a non-prerelease release.
+      - name: Make CDN release copies
+        run: |
+          set -eux
+          cat > "$RUNNER_TEMP/cdn.js" <<'EOF'
+          var fs = require( "fs" ),
+            ver = JSON.parse( fs.readFileSync( "package.json", "utf8" ) ).version,
+            devFile = "dist/jquery.js",
+            minFile = "dist/jquery.min.js",
+            mapFile = "dist/jquery.min.map",
+            cdnFolder = "dist/cdn",
+            releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+            };
+          if ( !fs.existsSync( cdnFolder ) ) {
+            fs.mkdirSync( cdnFolder );
+          }
+          Object.keys( releaseFiles ).forEach(function( key ) {
+            var text,
+              builtFile = releaseFiles[ key ],
+              unpathedFile = key.replace( /VER/g, ver ),
+              releaseFile = cdnFolder + "/" + unpathedFile;
+            if ( /\.map$/.test( releaseFile ) ) {
+              // Map files reference the renamed uncompressed/minified files.
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                  "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                  "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( /\.min\.js$/.test( releaseFile ) ) {
+              // The source map comment is removed from the CDN copies.
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /\/\/# sourceMappingURL=\S+/, "" );
+              fs.writeFileSync( releaseFile, text );
+            } else {
+              fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+            }
+            console.log( releaseFile + " <- " + builtFile );
+          });
+          EOF
+          node "$RUNNER_TEMP/cdn.js"
+          ls -l dist/cdn
+          sha256sum dist/cdn/*
+
+      # ---- QUnit browser suite (same as .travis.yml), against the dist/ built above. ----
+      # Runs before npm pack, which removes .github (where the test scripts live).
+
+      # Node 16 only drives the headless runner; it stays off PATH and is called by absolute path.
+      - name: Install node 16.20.2 (test runner only, not on PATH)
+        run: |
+          set -euxo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/node16.tar.gz" https://nodejs.org/dist/v16.20.2/node-v16.20.2-linux-x64.tar.gz
+          mkdir -p "$RUNNER_TEMP/node16"
+          tar -xzf "$RUNNER_TEMP/node16.tar.gz" -C "$RUNNER_TEMP/node16" --strip-components=1
+          echo "NODE16=$RUNNER_TEMP/node16" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/node16/bin/node" -v
+
+      - name: Install Chromium shared libraries
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libnss3 libxss1 libasound2 libatk-bridge2.0-0 libgtk-3-0 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libcups2 libdrm2 libxkbcommon0 fonts-liberation
+
+      # Apache + mod_php serving a copy of the built tree (incl. dist/) at http://127.0.0.1/jquery.
+      - name: Serve the built tree with Apache + mod_php
+        run: |
+          set -eux
+          bash .github/scripts/serve-with-apache.sh
+
+      # puppeteer 1.20.0 bundles Chromium 78, which still allows the synchronous XHR
+      # during unload that test #14379 relies on (removed in Chrome 80).
+      - name: Install puppeteer@1.20.0 into /tmp/runner
+        run: |
+          set -eux
+          PATH="$NODE16/bin:$PATH" npm install --prefix /tmp/runner --registry=https://registry.npmjs.org/ --no-audit --no-fund --no-package-lock puppeteer@1.20.0
+          ls /tmp/runner/node_modules
+
+      - name: Run QUnit browser suite
+        run: |
+          set -eux
+          NODE_PATH=/tmp/runner/node_modules TEST_BASE_URL=http://127.0.0.1/jquery TEST_TIMEOUT_MIN=20 "$NODE16/bin/node" .github/scripts/run-browser-tests.js
+
+      - name: Tail Apache error log
+        if: failure()
+        run: sudo tail -n 50 /var/log/apache2/error.log
+
+      # .github is not in the public tarball; drop it rather than touching .npmignore.
+      - name: npm pack
+        run: |
+          set -eux
+          rm -rf .github
+          npm pack
+          ls -l jquery-1.11.1.tgz
+          tar tzvf jquery-1.11.1.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jquery-1.11.1
+          path: jquery-1.11.1.tgz
+          if-no-files-found: error

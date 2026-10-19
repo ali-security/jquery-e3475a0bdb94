@@ -358,7 +358,8 @@ asyncTest("isPlainObject", function() {
 		window.iframeDone = undefined;
 		iframe.parentNode.removeChild( iframe );
 		ok( jQuery.isPlainObject(new otherObject()), "new otherObject" + ( detail ? " - " + detail : "" ) );
-		start();
+		// Chromium may fire onload synchronously inside doc.close(), before the test body returns
+		setTimeout( start );
 	};
 
 	try {
